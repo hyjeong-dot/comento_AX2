@@ -27,12 +27,14 @@ for result in ai_results:
     intent_secondary = intent.get('secondary', '')
     confidence = intent.get('confidence', 0)
     
-    job_slot = ai_ext.get('slots', {}).get('interest_job', {})
-    if isinstance(job_slot, list):
-        job_slot = job_slot[0] if len(job_slot) > 0 else {}
-    elif job_slot is None:
-        job_slot = {}
-        
+    # interest_job은 배열(0번째=primary, 1~2번째=secondary)
+    job_candidates = ai_ext.get('slots', {}).get('interest_job', [])
+    if isinstance(job_candidates, dict):
+        job_candidates = [job_candidates]
+    elif not isinstance(job_candidates, list):
+        job_candidates = []
+
+    job_slot = job_candidates[0] if job_candidates else {}
     job_cat = job_slot.get('job_category', '')
     job_cat_basis = job_slot.get('job_category_basis', '')
     job_det = job_slot.get('job_detail', '')
@@ -40,12 +42,17 @@ for result in ai_results:
     ind_basis = job_slot.get('industry_basis', '')
     job_raw = job_slot.get('raw_mention', '')
 
+    secondary_cats = ', '.join(
+        c.get('job_category', '') for c in job_candidates[1:] if c.get('job_category')
+    )
+
     # 캠프 매칭 결과 병합
     camp = camp_map.get(q_id, {})
     matched_key = camp.get('matched_key', '')
     matched_level = camp.get('matched_level', '')
     camp_count = camp.get('total_camp_candidates', 0)
     recommended = camp.get('recommended_camps', [])
+    supplementary_count = camp.get('supplementary_camp_count', 0)
     suitability_score = camp.get('suitability_score', '')
     needs_review = camp.get('needs_manual_review', False)
     review_reason = camp.get('review_reason', '')
@@ -58,6 +65,7 @@ for result in ai_results:
         'AI_Confidence': confidence,
         'AI_JobCategory': job_cat,
         'AI_JobCategory_근거': job_cat_basis,
+        'AI_Secondary직무': secondary_cats,
         'AI_JobDetail': job_det,
         'AI_Industry': ind,
         'AI_Industry_근거': ind_basis,
@@ -69,6 +77,7 @@ for result in ai_results:
         '추천캠프1': recommended[0] if len(recommended) > 0 else '',
         '추천캠프2': recommended[1] if len(recommended) > 1 else '',
         '추천캠프3': recommended[2] if len(recommended) > 2 else '',
+        'Secondary보충캠프수': supplementary_count,
         '적합도점수': suitability_score,
         '담당자리뷰필요': '⚠️ YES' if needs_review else '',
         '리뷰사유': review_reason or ''

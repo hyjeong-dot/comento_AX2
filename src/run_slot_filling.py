@@ -61,11 +61,17 @@ VALID_INTENTS = {
 }
 
 
+MAX_INTEREST_JOB_CANDIDATES = 3
+
+
 def validate_and_clean(extraction):
     """
     enums.json / 6개 intent 코드 대비 값을 검증한다.
     위반된 필드는 null로 되돌리고(교차 오염된 값을 그대로 매칭에 흘려보내지 않기 위함),
     위반 이력은 extraction['_enum_violations']에 남겨 추후 검수에 활용한다.
+
+    interest_job은 배열(최대 3개, 0번째=primary)이 정상 형태다. AI가 과거 스키마처럼
+    단일 dict로 응답하는 경우를 대비해 배열로 감싸고, 3개를 초과하면 앞의 3개만 남긴다.
     """
     violations = []
 
@@ -76,10 +82,19 @@ def validate_and_clean(extraction):
             violations.append(f"intent.{field}={value!r} (허용되지 않은 intent 코드)")
             intent[field] = None
 
-    job_slot = extraction.get('slots', {}).get('interest_job')
-    if isinstance(job_slot, list):
-        job_slot = job_slot[0] if job_slot else None
-    if isinstance(job_slot, dict):
+    job_slots = extraction.get('slots', {}).get('interest_job')
+    if isinstance(job_slots, dict):
+        job_slots = [job_slots]
+    elif not isinstance(job_slots, list):
+        job_slots = []
+
+    if len(job_slots) > MAX_INTEREST_JOB_CANDIDATES:
+        violations.append(f"interest_job 후보 {len(job_slots)}개 → 상위 {MAX_INTEREST_JOB_CANDIDATES}개만 유지")
+        job_slots = job_slots[:MAX_INTEREST_JOB_CANDIDATES]
+
+    for idx, job_slot in enumerate(job_slots):
+        if not isinstance(job_slot, dict):
+            continue
         for field, enum_key, basis_field in (
             ('job_category', 'job_category', 'job_category_basis'),
             ('job_detail', 'job_detail', None),
@@ -87,10 +102,12 @@ def validate_and_clean(extraction):
         ):
             value = job_slot.get(field)
             if value and value not in ENUMS[enum_key]:
-                violations.append(f"interest_job.{field}={value!r} (다른 필드의 enum 값이거나 존재하지 않는 값)")
+                violations.append(f"interest_job[{idx}].{field}={value!r} (다른 필드의 enum 값이거나 존재하지 않는 값)")
                 job_slot[field] = None
                 if basis_field:
                     job_slot[basis_field] = '없음'
+
+    extraction.setdefault('slots', {})['interest_job'] = job_slots
 
     if violations:
         extraction['_enum_violations'] = violations

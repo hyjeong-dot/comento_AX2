@@ -39,9 +39,23 @@ def build_camp_index(csv_path='data/직무코드_캠프명_매핑.csv'):
 # =========================================================================
 # 2. 3단계 폴백 매칭 로직
 # =========================================================================
-def match_camps(extraction, code_index, category_index):
+def get_job_candidates(extraction):
     """
-    AI 추출 결과 1건에 대해 3단계 폴백 + 카테고리 폴백으로 캠프를 매칭합니다.
+    slots.interest_job을 후보 리스트로 정규화한다.
+    interest_job은 배열(최대 3개, 0번째=primary)이 정상 형태이며,
+    구버전 단일 dict 응답이 섞여 있어도 안전하게 리스트로 감싼다.
+    """
+    job_slots = extraction.get('slots', {}).get('interest_job')
+    if isinstance(job_slots, dict):
+        job_slots = [job_slots]
+    elif not isinstance(job_slots, list):
+        job_slots = []
+    return [j for j in job_slots if isinstance(j, dict)]
+
+
+def _match_single_job(job_slot, code_index, category_index):
+    """
+    직무 후보 1건에 대해 3단계 폴백 + 카테고리 폴백으로 캠프를 매칭한다.
 
     matched_level은 항상 고정된 의미를 가집니다 (AI가 생성한 camp_matching_keys는
     참고용으로만 남기고 매칭 자체에는 사용하지 않음 — 중복 제거로 검색 키 개수가
@@ -60,15 +74,6 @@ def match_camps(extraction, code_index, category_index):
             "all_attempted_keys": [시도한 키 목록]
         }
     """
-    slots = extraction.get('slots', {})
-    job_slot = slots.get('interest_job', {})
-
-    # interest_job이 리스트인 경우 처리
-    if isinstance(job_slot, list):
-        job_slot = job_slot[0] if len(job_slot) > 0 else {}
-    elif job_slot is None:
-        job_slot = {}
-
     job_category = job_slot.get('job_category', '') or ''
     job_detail = job_slot.get('job_detail', '') or 'N/A'
     industry = job_slot.get('industry', '') or ''
@@ -123,6 +128,40 @@ def match_camps(extraction, code_index, category_index):
     }
 
 
+def match_camps(extraction, code_index, category_index):
+    """
+    interest_job 후보 중 0번째(primary)만으로 매칭레벨/적합도 점수를 결정한다.
+    (여러 직무가 동등하게 언급된 경우에도, 리뷰 여부 판단 로직은 기존과 동일하게
+    primary 하나만 기준으로 유지 — secondary는 find_supplementary_camps()가
+    보충 추천 캠프를 채우는 데만 쓰인다.)
+    """
+    candidates = get_job_candidates(extraction)
+    primary = candidates[0] if candidates else {}
+    return _match_single_job(primary, code_index, category_index)
+
+
+def find_supplementary_camps(extraction, code_index, category_index, exclude_camps, max_camps):
+    """
+    interest_job의 2번째 이후 후보(secondary)로 캠프를 추가 매칭해,
+    primary 매칭 결과에서 부족한 만큼(최대 max_camps개)만 보충한다.
+    matched_level/적합도 점수/리뷰 여부에는 영향을 주지 않는다.
+    """
+    if max_camps <= 0:
+        return []
+
+    exclude = set(exclude_camps)
+    supplementary = []
+    for job_slot in get_job_candidates(extraction)[1:]:
+        result = _match_single_job(job_slot, code_index, category_index)
+        for camp in result['camps']:
+            if camp in exclude or camp in supplementary:
+                continue
+            supplementary.append(camp)
+            if len(supplementary) >= max_camps:
+                return supplementary
+    return supplementary
+
+
 # =========================================================================
 # 2-1. 적합도 점수 산출 (matched_level 50 + confidence 30 + 추출근거 20)
 # =========================================================================
@@ -142,12 +181,8 @@ def calculate_suitability_score(extraction, match_result):
     intent = extraction.get('intent', {})
     confidence = intent.get('confidence', 0) or 0
 
-    slots = extraction.get('slots', {})
-    job_slot = slots.get('interest_job', {})
-    if isinstance(job_slot, list):
-        job_slot = job_slot[0] if len(job_slot) > 0 else {}
-    elif job_slot is None:
-        job_slot = {}
+    candidates = get_job_candidates(extraction)
+    job_slot = candidates[0] if candidates else {}
 
     job_category_basis = job_slot.get('job_category_basis', '없음')
     industry_basis = job_slot.get('industry_basis', '없음')
@@ -172,14 +207,17 @@ def calculate_suitability_score(extraction, match_result):
 # =========================================================================
 # 3. 추천 팝업 데이터 생성
 # =========================================================================
-def generate_popup_data(question_id, extraction, match_result):
+def generate_popup_data(question_id, extraction, match_result, code_index, category_index):
     """
     매칭 결과를 바탕으로 추천 팝업에 들어갈 데이터 구조를 생성합니다.
 
-    담당자 수동매칭 트리거는 두 가지:
+    담당자 수동매칭 트리거는 두 가지 (모두 primary 후보 기준, secondary는 관여 안 함):
       1) confidence <= 0.5 (AI 자체 확신도가 낮음)
       2) suitability_score <= 50 (matched_level+confidence+추출근거 종합 적합도가 낮음
          — camp_count==0, 카테고리 폴백 매칭도 이 조건에 자동으로 포함됨)
+
+    추천 캠프는 primary 매칭 결과를 먼저 채우고, 5개 캡 안에 자리가 남으면
+    secondary 후보(최대 2개)로 보충한다. 보충 캠프는 리뷰 여부 판단에 영향을 주지 않는다.
     """
     intent = extraction.get('intent', {})
     confidence = intent.get('confidence', 0) or 0
@@ -196,8 +234,18 @@ def generate_popup_data(question_id, extraction, match_result):
     else:
         review_reason = None
 
-    # 추천 캠프는 최대 5개까지만 노출
-    recommended_camps = match_result['camps'][:5]
+    # 추천 캠프는 최대 5개까지만 노출: primary 우선 채우고, 남는 자리는 secondary로 보충
+    primary_camps = match_result['camps'][:5]
+    supplementary_camps = find_supplementary_camps(
+        extraction, code_index, category_index,
+        exclude_camps=primary_camps, max_camps=5 - len(primary_camps)
+    )
+    recommended_camps = primary_camps + supplementary_camps
+
+    candidates = get_job_candidates(extraction)
+    secondary_job_categories = [
+        c.get('job_category') for c in candidates[1:] if c.get('job_category')
+    ]
 
     return {
         "question_id": question_id,
@@ -207,6 +255,8 @@ def generate_popup_data(question_id, extraction, match_result):
         "matched_level": match_result['matched_level'],
         "total_camp_candidates": match_result['camp_count'],
         "recommended_camps": recommended_camps,
+        "supplementary_camp_count": len(supplementary_camps),
+        "secondary_job_categories": secondary_job_categories,
         "suitability_score": score_info['total'],
         "score_breakdown": {
             "matched_level_score": score_info['matched_level_score'],
@@ -268,7 +318,7 @@ def main():
         match_result = match_camps(extraction, code_index, category_index)
         
         # 팝업 데이터 생성
-        popup = generate_popup_data(q_id, extraction, match_result)
+        popup = generate_popup_data(q_id, extraction, match_result, code_index, category_index)
         popup_results.append(popup)
         
         # 통계 업데이트
