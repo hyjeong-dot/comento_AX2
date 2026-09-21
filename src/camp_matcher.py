@@ -132,34 +132,41 @@ def match_camps(extraction, code_index, category_index):
     """
     interest_job 후보 중 0번째(primary)만으로 매칭레벨/적합도 점수를 결정한다.
     (여러 직무가 동등하게 언급된 경우에도, 리뷰 여부 판단 로직은 기존과 동일하게
-    primary 하나만 기준으로 유지 — secondary는 find_supplementary_camps()가
-    보충 추천 캠프를 채우는 데만 쓰인다.)
+    primary 하나만 기준으로 유지 — 실제 노출 캠프 구성은 assemble_recommended_camps()가
+    담당하며 매칭 품질이 더 좋은 secondary 후보를 우선할 수 있다.)
     """
     candidates = get_job_candidates(extraction)
     primary = candidates[0] if candidates else {}
     return _match_single_job(primary, code_index, category_index)
 
 
-def find_supplementary_camps(extraction, code_index, category_index, exclude_camps, max_camps):
+def assemble_recommended_camps(extraction, primary_match, code_index, category_index, cap=5):
     """
-    interest_job의 2번째 이후 후보(secondary)로 캠프를 추가 매칭해,
-    primary 매칭 결과에서 부족한 만큼(최대 max_camps개)만 보충한다.
-    matched_level/적합도 점수/리뷰 여부에는 영향을 주지 않는다.
-    """
-    if max_camps <= 0:
-        return []
+    primary + secondary 후보를 전부 매칭해본 뒤, matched_level이 좋은(숫자가 작은)
+    순서대로 캠프를 채운다. "primary가 배열 0번째라서 무조건 먼저 채운다"가 아니라
+    "실제로 더 정밀하게 매칭된 후보를 먼저 보여준다"가 기준이다.
 
-    exclude = set(exclude_camps)
-    supplementary = []
+    예: primary가 레벨4(카테고리 전체 폴백)로 12개를 찾아 5개 캡을 이미 채워도,
+    secondary가 레벨2로 1개를 찾았다면 그 1개가 먼저 노출되고 나머지 4자리를
+    primary의 폴백 풀에서 채운다. 적합도 점수/리뷰 여부는 이 함수와 무관하게
+    primary_match만으로 결정된 값을 그대로 쓴다.
+    """
+    all_matches = [primary_match]
     for job_slot in get_job_candidates(extraction)[1:]:
-        result = _match_single_job(job_slot, code_index, category_index)
-        for camp in result['camps']:
-            if camp in exclude or camp in supplementary:
+        all_matches.append(_match_single_job(job_slot, code_index, category_index))
+
+    # 매칭 실패(레벨0)는 캠프가 없어 자연히 뒤로 밀리지만, 명시적으로도 최하위로 정렬
+    ordered = sorted(all_matches, key=lambda m: m['matched_level'] if m['matched_level'] > 0 else 99)
+
+    recommended = []
+    for m in ordered:
+        for camp in m['camps']:
+            if camp in recommended:
                 continue
-            supplementary.append(camp)
-            if len(supplementary) >= max_camps:
-                return supplementary
-    return supplementary
+            recommended.append(camp)
+            if len(recommended) >= cap:
+                return recommended
+    return recommended
 
 
 # =========================================================================
@@ -216,8 +223,9 @@ def generate_popup_data(question_id, extraction, match_result, code_index, categ
       2) suitability_score <= 50 (matched_level+confidence+추출근거 종합 적합도가 낮음
          — camp_count==0, 카테고리 폴백 매칭도 이 조건에 자동으로 포함됨)
 
-    추천 캠프는 primary 매칭 결과를 먼저 채우고, 5개 캡 안에 자리가 남으면
-    secondary 후보(최대 2개)로 보충한다. 보충 캠프는 리뷰 여부 판단에 영향을 주지 않는다.
+    추천 캠프는 primary+secondary 후보를 전부 매칭해본 뒤 matched_level이 더 좋은
+    (정밀한) 후보의 캠프를 우선 노출한다 (assemble_recommended_camps 참고).
+    보충 캠프는 리뷰 여부 판단에는 영향을 주지 않는다.
     """
     intent = extraction.get('intent', {})
     confidence = intent.get('confidence', 0) or 0
@@ -234,13 +242,10 @@ def generate_popup_data(question_id, extraction, match_result, code_index, categ
     else:
         review_reason = None
 
-    # 추천 캠프는 최대 5개까지만 노출: primary 우선 채우고, 남는 자리는 secondary로 보충
-    primary_camps = match_result['camps'][:5]
-    supplementary_camps = find_supplementary_camps(
-        extraction, code_index, category_index,
-        exclude_camps=primary_camps, max_camps=5 - len(primary_camps)
-    )
-    recommended_camps = primary_camps + supplementary_camps
+    # 추천 캠프는 최대 5개까지만 노출: 후보 전체를 매칭 품질순으로 정렬해 채움
+    recommended_camps = assemble_recommended_camps(extraction, match_result, code_index, category_index)
+    primary_camp_set = set(match_result['camps'])
+    supplementary_camp_count = sum(1 for c in recommended_camps if c not in primary_camp_set)
 
     candidates = get_job_candidates(extraction)
     secondary_job_categories = [
@@ -255,7 +260,7 @@ def generate_popup_data(question_id, extraction, match_result, code_index, categ
         "matched_level": match_result['matched_level'],
         "total_camp_candidates": match_result['camp_count'],
         "recommended_camps": recommended_camps,
-        "supplementary_camp_count": len(supplementary_camps),
+        "supplementary_camp_count": supplementary_camp_count,
         "secondary_job_categories": secondary_job_categories,
         "suitability_score": score_info['total'],
         "score_breakdown": {
