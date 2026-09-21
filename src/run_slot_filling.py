@@ -47,13 +47,69 @@ def call_potens_api(system_prompt, user_content):
         return "{}"
 
 # =========================================================================
-# 2. 메인 슬롯필링 파이프라인 (수정 불필요)
+# 1-1. Enum 검증 안전망
+# 프롬프트를 강화해도 AI가 다른 필드(enum 리스트) 소속 값을 잘못된 필드에
+# 채우는 교차 오염을 완전히 막을 수는 없어서, 응답 파싱 후 data/enums.json과
+# 대조해 위반 필드는 null로 되돌리는 후처리를 추가한다.
+# =========================================================================
+with open('data/enums.json', 'r', encoding='utf-8') as f:
+    ENUMS = json.load(f)
+
+VALID_INTENTS = {
+    'CAREER_DIRECTION', 'SKILL_GAP', 'EXPERIENCE_GAP',
+    'APPLICATION_PREP', 'CAREER_TRANSITION', 'COMPOUND'
+}
+
+
+def validate_and_clean(extraction):
+    """
+    enums.json / 6개 intent 코드 대비 값을 검증한다.
+    위반된 필드는 null로 되돌리고(교차 오염된 값을 그대로 매칭에 흘려보내지 않기 위함),
+    위반 이력은 extraction['_enum_violations']에 남겨 추후 검수에 활용한다.
+    """
+    violations = []
+
+    intent = extraction.get('intent', {}) or {}
+    for field in ('primary', 'secondary'):
+        value = intent.get(field)
+        if value and value not in VALID_INTENTS:
+            violations.append(f"intent.{field}={value!r} (허용되지 않은 intent 코드)")
+            intent[field] = None
+
+    job_slot = extraction.get('slots', {}).get('interest_job')
+    if isinstance(job_slot, list):
+        job_slot = job_slot[0] if job_slot else None
+    if isinstance(job_slot, dict):
+        for field, enum_key, basis_field in (
+            ('job_category', 'job_category', 'job_category_basis'),
+            ('job_detail', 'job_detail', None),
+            ('industry', 'industry', 'industry_basis'),
+        ):
+            value = job_slot.get(field)
+            if value and value not in ENUMS[enum_key]:
+                violations.append(f"interest_job.{field}={value!r} (다른 필드의 enum 값이거나 존재하지 않는 값)")
+                job_slot[field] = None
+                if basis_field:
+                    job_slot[basis_field] = '없음'
+
+    if violations:
+        extraction['_enum_violations'] = violations
+    return extraction
+
+
+# =========================================================================
+# 2. 메인 슬롯필링 파이프라인
 # =========================================================================
 def main():
     # 데이터 및 프롬프트 로드
     print("데이터 로딩 중...")
     df = pd.read_excel('data/community_qna_samples_20260910.xlsx')
-    
+
+    # 취업 고민 카테고리 그룹만 대상으로 유형화 진행 (이직 고민, 대학생 고민, 랜선 사수 등 제외)
+    before_count = len(df)
+    df = df[df['question_category_group'] == '취업 고민'].reset_index(drop=True)
+    print(f"카테고리 그룹 필터링: {before_count}건 → {len(df)}건 (취업 고민만)")
+
     # 테스트용 50건만 추출
     test_df = df.head(50).copy()
     
@@ -87,12 +143,16 @@ def main():
                 ai_response_text = ai_response_text.split("```")[1].strip()
                 
             parsed_json = json.loads(ai_response_text) # JSON 문법 검증
-            
+            parsed_json = validate_and_clean(parsed_json)  # enum 교차 오염 검증 및 정리
+
             results.append({
                 "question_id": row['question_id'],
                 "ai_extraction": parsed_json
             })
-            print(f"  ✅ 성공 (Intent: {parsed_json.get('intent', {}).get('primary', 'N/A')})")
+            if parsed_json.get('_enum_violations'):
+                print(f"  ⚠️  성공했지만 enum 위반 감지 → null 처리: {parsed_json['_enum_violations']}")
+            else:
+                print(f"  ✅ 성공 (Intent: {parsed_json.get('intent', {}).get('primary', 'N/A')})")
             
         except json.JSONDecodeError:
             print(f"  ❌ JSON 파싱 에러 (반환값 형식이 잘못됨)")

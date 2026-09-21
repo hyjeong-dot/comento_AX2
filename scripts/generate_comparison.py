@@ -1,8 +1,9 @@
 import pandas as pd
 import json
 
-# 1. 원본 데이터 로드 (50건)
-df_origin = pd.read_excel('data/community_qna_samples_20260910.xlsx').head(50)
+# 1. 원본 데이터 로드 (취업 고민 그룹만, run_slot_filling.py와 동일한 필터링 적용 후 50건)
+df_origin = pd.read_excel('data/community_qna_samples_20260910.xlsx')
+df_origin = df_origin[df_origin['question_category_group'] == '취업 고민'].reset_index(drop=True).head(50)
 
 # 2. AI 추출 결과 JSON 로드
 with open('results/slot_filling_results.json', 'r', encoding='utf-8') as f:
@@ -33,16 +34,19 @@ for result in ai_results:
         job_slot = {}
         
     job_cat = job_slot.get('job_category', '')
+    job_cat_basis = job_slot.get('job_category_basis', '')
     job_det = job_slot.get('job_detail', '')
     ind = job_slot.get('industry', '')
+    ind_basis = job_slot.get('industry_basis', '')
     job_raw = job_slot.get('raw_mention', '')
-    
+
     # 캠프 매칭 결과 병합
     camp = camp_map.get(q_id, {})
     matched_key = camp.get('matched_key', '')
     matched_level = camp.get('matched_level', '')
     camp_count = camp.get('total_camp_candidates', 0)
     recommended = camp.get('recommended_camps', [])
+    suitability_score = camp.get('suitability_score', '')
     needs_review = camp.get('needs_manual_review', False)
     review_reason = camp.get('review_reason', '')
     
@@ -53,8 +57,10 @@ for result in ai_results:
         'AI_Intent(부)': intent_secondary,
         'AI_Confidence': confidence,
         'AI_JobCategory': job_cat,
+        'AI_JobCategory_근거': job_cat_basis,
         'AI_JobDetail': job_det,
         'AI_Industry': ind,
+        'AI_Industry_근거': ind_basis,
         'AI_직무근거(발췌)': job_raw,
         # 캠프 매칭 결과
         '매칭키': matched_key,
@@ -63,6 +69,7 @@ for result in ai_results:
         '추천캠프1': recommended[0] if len(recommended) > 0 else '',
         '추천캠프2': recommended[1] if len(recommended) > 1 else '',
         '추천캠프3': recommended[2] if len(recommended) > 2 else '',
+        '적합도점수': suitability_score,
         '담당자리뷰필요': '⚠️ YES' if needs_review else '',
         '리뷰사유': review_reason or ''
     })

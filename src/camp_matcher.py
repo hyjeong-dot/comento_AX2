@@ -41,11 +41,20 @@ def build_camp_index(csv_path='data/직무코드_캠프명_매핑.csv'):
 # =========================================================================
 def match_camps(extraction, code_index, category_index):
     """
-    AI 추출 결과 1건에 대해 3단계 폴백으로 캠프를 매칭합니다.
-    
+    AI 추출 결과 1건에 대해 3단계 폴백 + 카테고리 폴백으로 캠프를 매칭합니다.
+
+    matched_level은 항상 고정된 의미를 가집니다 (AI가 생성한 camp_matching_keys는
+    참고용으로만 남기고 매칭 자체에는 사용하지 않음 — 중복 제거로 검색 키 개수가
+    바뀌면서 동일한 폴백 단계가 매번 다른 레벨 번호로 찍히는 문제를 방지하기 위함):
+        1 = 정확매칭 (job_category-job_detail-industry)
+        2 = 상세생략 (job_category-N/A-industry)
+        3 = 산업확장 (job_category-job_detail-산업무관)
+        4 = 카테고리 폴백 (job_category 전체)
+        0 = 매칭 실패
+
     Returns:
         dict: {
-            "matched_level": 1~4 또는 0(실패),
+            "matched_level": 0~4,
             "matched_key": 매칭된 직무코드,
             "camps": [캠프명 리스트],
             "all_attempted_keys": [시도한 키 목록]
@@ -53,52 +62,35 @@ def match_camps(extraction, code_index, category_index):
     """
     slots = extraction.get('slots', {})
     job_slot = slots.get('interest_job', {})
-    
+
     # interest_job이 리스트인 경우 처리
     if isinstance(job_slot, list):
         job_slot = job_slot[0] if len(job_slot) > 0 else {}
     elif job_slot is None:
         job_slot = {}
-    
+
     job_category = job_slot.get('job_category', '') or ''
     job_detail = job_slot.get('job_detail', '') or 'N/A'
     industry = job_slot.get('industry', '') or ''
-    
+
     # None이나 "null" 문자열 처리
     if job_detail in (None, 'null', 'None', ''):
         job_detail = 'N/A'
-    
-    # AI가 이미 생성한 camp_matching_keys 활용
-    ai_keys = extraction.get('camp_matching_keys', {})
-    prefix = ai_keys.get('job_code_prefix', '')
-    fallbacks = ai_keys.get('fallback_codes', [])
-    
-    # 3단계 폴백 키 구성 (AI가 생성한 키 + 직접 생성한 키 병합, 중복 제거)
-    search_keys = []
-    
-    # 1순위: 정확매칭 {job_category}-{job_detail}-{industry}
-    key1 = f"{job_category}-{job_detail}-{industry}"
-    search_keys.append(key1)
-    
-    # 2순위: 상세생략 {job_category}-N/A-{industry}
-    key2 = f"{job_category}-N/A-{industry}"
-    if key2 != key1:
-        search_keys.append(key2)
-    
-    # 3순위: 산업확장 {job_category}-{job_detail}-산업무관
-    key3 = f"{job_category}-{job_detail}-산업무관"
-    if key3 not in search_keys:
-        search_keys.append(key3)
-    
-    # AI가 만든 키 중 누락된 것 추가
-    if prefix and prefix not in search_keys:
-        search_keys.insert(0, prefix)
-    for fb in fallbacks:
-        if fb not in search_keys:
-            search_keys.append(fb)
-    
-    # 순차적으로 매칭 시도
-    for level, key in enumerate(search_keys, 1):
+
+    # 고정 3단계 캐노니컬 키 (레벨 번호는 이 순서에 고정)
+    canonical_keys = [
+        (1, f"{job_category}-{job_detail}-{industry}"),      # 1순위: 정확매칭
+        (2, f"{job_category}-N/A-{industry}"),                # 2순위: 상세생략
+        (3, f"{job_category}-{job_detail}-산업무관"),          # 3순위: 산업확장
+    ]
+
+    tried_keys = []
+    seen_keys = set()
+    for level, key in canonical_keys:
+        tried_keys.append(key)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
         camps = code_index.get(key, [])
         if camps:
             return {
@@ -106,28 +98,74 @@ def match_camps(extraction, code_index, category_index):
                 "matched_key": key,
                 "camps": camps,
                 "camp_count": len(camps),
-                "all_attempted_keys": search_keys
+                "all_attempted_keys": tried_keys
             }
-    
-    # 4순위 (최종 폴백): 직무중분류 전체
+
+    # 4순위 (고정, 최종 폴백): 직무중분류 전체
     if job_category and job_category in category_index:
         camps = category_index[job_category]
         return {
-            "matched_level": len(search_keys) + 1,
+            "matched_level": 4,
             "matched_key": f"[카테고리 폴백] {job_category}",
             "camps": camps,
             "camp_count": len(camps),
-            "all_attempted_keys": search_keys + [f"(카테고리) {job_category}"]
+            "all_attempted_keys": tried_keys + [f"(카테고리) {job_category}"]
         }
-    
+
     # 매칭 실패
     return {
         "matched_level": 0,
         "matched_key": None,
         "camps": [],
         "camp_count": 0,
-        "all_attempted_keys": search_keys,
+        "all_attempted_keys": tried_keys,
         "flag": "LOW_CONFIDENCE_MANUAL_REVIEW"
+    }
+
+
+# =========================================================================
+# 2-1. 적합도 점수 산출 (matched_level 50 + confidence 30 + 추출근거 20)
+# =========================================================================
+LEVEL_SCORE = {0: 0, 1: 50, 2: 30, 3: 15, 4: 0}
+BASIS_WEIGHT = {'명시': 1.0, '추론': 0.5, '없음': 0.0}
+
+
+def calculate_suitability_score(extraction, match_result):
+    """
+    matched_level(최대 50) + confidence(최대 30) + 추출근거(최대 20)를 합산한
+    0~100점 적합도 점수를 계산합니다.
+
+    matched_level 0(매칭 실패)/4(카테고리 폴백)는 0점 처리되어, confidence와
+    추출근거가 아무리 높아도 최대 50점(confidence 30 + 근거 20)을 넘을 수 없습니다.
+    즉 이 두 레벨은 다른 지표와 무관하게 항상 담당자 리뷰 대상이 됩니다.
+    """
+    intent = extraction.get('intent', {})
+    confidence = intent.get('confidence', 0) or 0
+
+    slots = extraction.get('slots', {})
+    job_slot = slots.get('interest_job', {})
+    if isinstance(job_slot, list):
+        job_slot = job_slot[0] if len(job_slot) > 0 else {}
+    elif job_slot is None:
+        job_slot = {}
+
+    job_category_basis = job_slot.get('job_category_basis', '없음')
+    industry_basis = job_slot.get('industry_basis', '없음')
+
+    level_score = LEVEL_SCORE.get(match_result['matched_level'], 0)
+    confidence_score = confidence * 30
+    basis_score = (
+        BASIS_WEIGHT.get(job_category_basis, 0.0) * 12 +
+        BASIS_WEIGHT.get(industry_basis, 0.0) * 8
+    )
+
+    return {
+        "total": round(level_score + confidence_score + basis_score, 1),
+        "matched_level_score": level_score,
+        "confidence_score": round(confidence_score, 1),
+        "basis_score": round(basis_score, 1),
+        "job_category_basis": job_category_basis,
+        "industry_basis": industry_basis,
     }
 
 
@@ -137,20 +175,30 @@ def match_camps(extraction, code_index, category_index):
 def generate_popup_data(question_id, extraction, match_result):
     """
     매칭 결과를 바탕으로 추천 팝업에 들어갈 데이터 구조를 생성합니다.
+
+    담당자 수동매칭 트리거는 두 가지:
+      1) confidence <= 0.5 (AI 자체 확신도가 낮음)
+      2) suitability_score <= 50 (matched_level+confidence+추출근거 종합 적합도가 낮음
+         — camp_count==0, 카테고리 폴백 매칭도 이 조건에 자동으로 포함됨)
     """
     intent = extraction.get('intent', {})
-    confidence = intent.get('confidence', 0)
-    
-    # 담당자 리뷰 필요 여부 판단
-    needs_review = (
-        confidence < 0.5 or 
-        match_result['camp_count'] == 0 or
-        match_result.get('flag') == 'LOW_CONFIDENCE_MANUAL_REVIEW'
-    )
-    
+    confidence = intent.get('confidence', 0) or 0
+    score_info = calculate_suitability_score(extraction, match_result)
+
+    needs_review = confidence <= 0.5 or score_info['total'] <= 50
+
+    if match_result['camp_count'] == 0:
+        review_reason = "NO_CAMP_MATCH"
+    elif confidence <= 0.5:
+        review_reason = "LOW_CONFIDENCE"
+    elif score_info['total'] <= 50:
+        review_reason = "LOW_SUITABILITY_SCORE"
+    else:
+        review_reason = None
+
     # 추천 캠프는 최대 5개까지만 노출
     recommended_camps = match_result['camps'][:5]
-    
+
     return {
         "question_id": question_id,
         "intent_primary": intent.get('primary', 'UNKNOWN'),
@@ -159,12 +207,16 @@ def generate_popup_data(question_id, extraction, match_result):
         "matched_level": match_result['matched_level'],
         "total_camp_candidates": match_result['camp_count'],
         "recommended_camps": recommended_camps,
+        "suitability_score": score_info['total'],
+        "score_breakdown": {
+            "matched_level_score": score_info['matched_level_score'],
+            "confidence_score": score_info['confidence_score'],
+            "basis_score": score_info['basis_score'],
+            "job_category_basis": score_info['job_category_basis'],
+            "industry_basis": score_info['industry_basis'],
+        },
         "needs_manual_review": needs_review,
-        "review_reason": (
-            "LOW_CONFIDENCE" if confidence < 0.5 
-            else "NO_CAMP_MATCH" if match_result['camp_count'] == 0 
-            else None
-        )
+        "review_reason": review_reason
     }
 
 
@@ -251,7 +303,7 @@ def main():
     print(f"  AI 추출 에러: {stats['errors']}건")
     print(f"\n  매칭 레벨별 분포:")
     for level in sorted(stats['by_level'].keys()):
-        label = {0: "실패", 1: "1순위(정확)", 2: "2순위(상세생략)", 3: "3순위(산업확장)", }.get(level, f"{level}순위(폴백)")
+        label = {0: "실패", 1: "1순위(정확)", 2: "2순위(상세생략)", 3: "3순위(산업확장)", 4: "4순위(카테고리 폴백)"}.get(level, f"{level}순위")
         print(f"    Level {level} ({label}): {stats['by_level'][level]}건")
     
     print(f"\n🎉 결과 저장 완료: {output_path}")
