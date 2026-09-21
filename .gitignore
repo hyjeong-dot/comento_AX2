@@ -1,0 +1,8 @@
+.venv/
+.env
+__pycache__/
+*.pyc
+.DS_Store
+results/slot_filling_results.json
+results/camp_matching_results.json
+results/pilot_test_comparison.xlsx
