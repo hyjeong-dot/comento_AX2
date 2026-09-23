@@ -150,20 +150,31 @@ def assemble_recommended_camps(extraction, primary_match, code_index, category_i
     secondary가 레벨2로 1개를 찾았다면 그 1개가 먼저 노출되고 나머지 4자리를
     primary의 폴백 풀에서 채운다. 적합도 점수/리뷰 여부는 이 함수와 무관하게
     primary_match만으로 결정된 값을 그대로 쓴다.
+
+    캠프마다 어느 관심 직무 후보(job_candidate_index, 1=primary)에서 몇 레벨로
+    매칭됐는지 함께 저장한다. 여러 후보에 같은 캠프가 있으면 먼저 채워진
+    (레벨이 더 좋은) 후보 기준으로 기록된다.
     """
-    all_matches = [primary_match]
-    for job_slot in get_job_candidates(extraction)[1:]:
-        all_matches.append(_match_single_job(job_slot, code_index, category_index))
+    all_matches = [(1, primary_match)]
+    for idx, job_slot in enumerate(get_job_candidates(extraction)[1:], start=2):
+        all_matches.append((idx, _match_single_job(job_slot, code_index, category_index)))
 
     # 매칭 실패(레벨0)는 캠프가 없어 자연히 뒤로 밀리지만, 명시적으로도 최하위로 정렬
-    ordered = sorted(all_matches, key=lambda m: m['matched_level'] if m['matched_level'] > 0 else 99)
+    ordered = sorted(all_matches, key=lambda x: x[1]['matched_level'] if x[1]['matched_level'] > 0 else 99)
 
     recommended = []
-    for m in ordered:
+    seen = set()
+    for job_idx, m in ordered:
         for camp in m['camps']:
-            if camp in recommended:
+            if camp in seen:
                 continue
-            recommended.append(camp)
+            seen.add(camp)
+            recommended.append({
+                "camp_name": camp,
+                "job_candidate_index": job_idx,
+                "matched_level": m['matched_level'],
+                "matched_key": m['matched_key'],
+            })
             if len(recommended) >= cap:
                 return recommended
     return recommended
@@ -245,7 +256,7 @@ def generate_popup_data(question_id, extraction, match_result, code_index, categ
     # 추천 캠프는 최대 5개까지만 노출: 후보 전체를 매칭 품질순으로 정렬해 채움
     recommended_camps = assemble_recommended_camps(extraction, match_result, code_index, category_index)
     primary_camp_set = set(match_result['camps'])
-    supplementary_camp_count = sum(1 for c in recommended_camps if c not in primary_camp_set)
+    supplementary_camp_count = sum(1 for c in recommended_camps if c['camp_name'] not in primary_camp_set)
 
     candidates = get_job_candidates(extraction)
     secondary_job_categories = [

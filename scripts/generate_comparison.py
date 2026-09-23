@@ -51,7 +51,11 @@ for result in ai_results:
     matched_key = camp.get('matched_key', '')
     matched_level = camp.get('matched_level', '')
     camp_count = camp.get('total_camp_candidates', 0)
-    recommended = camp.get('recommended_camps', [])
+    recommended_items = camp.get('recommended_camps', [])
+    recommended = [c['camp_name'] for c in recommended_items]
+    recommended_levels = ', '.join(
+        f"L{c['matched_level']}(직무{c['job_candidate_index']})" for c in recommended_items
+    )
     supplementary_count = camp.get('supplementary_camp_count', 0)
     suitability_score = camp.get('suitability_score', '')
     needs_review = camp.get('needs_manual_review', False)
@@ -77,6 +81,7 @@ for result in ai_results:
         '추천캠프1': recommended[0] if len(recommended) > 0 else '',
         '추천캠프2': recommended[1] if len(recommended) > 1 else '',
         '추천캠프3': recommended[2] if len(recommended) > 2 else '',
+        '추천캠프레벨': recommended_levels,
         'Secondary보충캠프수': supplementary_count,
         '적합도점수': suitability_score,
         '담당자리뷰필요': '⚠️ YES' if needs_review else '',
